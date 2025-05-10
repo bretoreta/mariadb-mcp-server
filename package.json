@@ -13,11 +13,7 @@
     "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js', '755')\"",
     "prepare": "npm run build",
     "watch": "tsc --watch",
-    "start": "node dist/index.js",
-    "inspector": "npx @modelcontextprotocol/inspector dist/index.js",
-    "test:setup": "node test-setup.js",
-    "test:tools": "node test-tools.js",
-    "test": "npm run test:setup && npm run test:tools"
+    "start": "node dist/index.js"
   },
   "keywords": [
     "mcp",
@@ -35,12 +31,14 @@
   "author": "Roberto Salgado <roberto@rjssistemas.com.br>",
   "license": "MIT",
   "dependencies": {
+    "@hono/node-server": "^1.14.1",
     "@modelcontextprotocol/sdk": "1.8.0",
+    "hono": "^4.7.9",
     "mariadb": "^3.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.16",
-    "dotenv": "^16.4.7",
+    "dotenv": "^16.5.0",
     "typescript": "^5.8.2"
   }
 }

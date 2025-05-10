@@ -3,6 +3,7 @@
  */
 
 import mariadb from "mariadb";
+import "dotenv/config";
 import { MariaDBConfig } from "./types.js";
 import { isAlloowedQuery } from "./validators.js";
 
@@ -119,7 +120,7 @@ export function getConfigFromEnv(): MariaDBConfig {
   const host = process.env.MARIADB_HOST;
   const portStr = process.env.MARIADB_PORT;
   const user = process.env.MARIADB_USER;
-  const password = process.env.MARIADB_PASSWORD;
+  const password = process.env.MARIADB_PASSWORD as string;
   const database = process.env.MARIADB_DATABASE;
   const allow_insert = process.env.MARIADB_ALLOW_INSERT === "true";
   const allow_update = process.env.MARIADB_ALLOW_UPDATE === "true";
@@ -127,8 +128,6 @@ export function getConfigFromEnv(): MariaDBConfig {
 
   if (!host) throw new Error("MARIADB_HOST environment variable is required");
   if (!user) throw new Error("MARIADB_USER environment variable is required");
-  if (!password)
-    throw new Error("MARIADB_PASSWORD environment variable is required");
 
   const port = portStr ? parseInt(portStr, 10) : 3306;
 

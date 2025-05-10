@@ -1,268 +1,261 @@
 #!/usr/bin/env node
-
-/**
- * MariaDB Database Access MCP Server
- *
- * This MCP server provides access to MariaDB databases.
- * It allows:
- * - Listing available databases
- * - Listing tables in a database
- * - Describing table schemas
- * - Executing read-only SQL queries
- */
-
+import "dotenv/config";
+import { randomUUID } from "crypto";
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { streamSSE } from "hono/streaming";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
-  ErrorCode,
   ListToolsRequestSchema,
+  CallToolRequestSchema,
+  JSONRPCMessage,
   McpError,
+  ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createConnectionPool, executeQuery } from "./connection.js";
 
-import {
-  createConnectionPool,
-  executeQuery,
-  endConnection,
-} from "./connection.js";
+// ─── Transport Interface ──────────────────────────────────────────────────────
+interface Transport {
+  start(): Promise<void>;
+  send(msg: JSONRPCMessage): Promise<void>;
+  close(): Promise<void>;
+  onmessage?: (msg: JSONRPCMessage) => void;
+  onerror?: (err: Error) => void;
+  onclose?: () => void;
+}
 
-/**
- * Create an MCP server with tools for MariaDB database access
- */
-const server = new Server(
+// ─── SSETransport ─────────────────────────────────────────────────────────────
+class SSETransport implements Transport {
+  public sessionId: string;
+  public onmessage?: (msg: JSONRPCMessage) => void;
+  public onerror?: (err: Error) => void;
+  public onclose?: () => void;
+
+  constructor(private stream: any) {
+    this.sessionId = randomUUID();
+    // Hono’s streaming API gives us onAbort, not .on('error')
+    this.stream.onAbort(() => {
+      this.onclose?.();
+    });
+  }
+
+  async start(): Promise<void> {
+    await this.send({
+      jsonrpc: "2.0",
+      method: "session.start",
+      params: { sessionId: this.sessionId, timestamp: Date.now() },
+    });
+  }
+
+  async send(msg: JSONRPCMessage): Promise<void> {
+    try {
+      await this.stream.writeSSE({ data: JSON.stringify(msg) });
+    } catch (err: any) {
+      this.onerror?.(err);
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.stream.close();
+    this.onclose?.();
+  }
+}
+
+type JSONRPCRequest = Extract<
+  JSONRPCMessage,
+  { jsonrpc: "2.0"; method: string; params?: unknown }
+>;
+
+// ─── MCP Server Setup ─────────────────────────────────────────────────────────
+const mcpServer = new Server(
   {
     name: "mariadb-mcp-server",
-    version: "0.0.1",
+    version: "0.1.0",
+    description: "MariaDB database access MCP server",
   },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { capabilities: { tools: {} } }
 );
 
-/**
- * Handler that lists available tools for MariaDB database access
- */
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "list_databases",
-        description: "List all accessible databases on the MariaDB server",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          required: [],
-        },
+// 1) ListTools handler
+mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "list_databases",
+      description: "List all databases",
+      inputSchema: { type: "object" },
+    },
+    {
+      name: "list_tables",
+      description: "List tables in a database",
+      inputSchema: {
+        type: "object",
+        properties: { database: { type: "string" } },
       },
-      {
-        name: "list_tables",
-        description: "List all tables in a specified database",
-        inputSchema: {
-          type: "object",
-          properties: {
-            database: {
-              type: "string",
-              description:
-                "Database name (optional, uses default if not specified)",
-            },
-          },
-          required: [],
-        },
+    },
+    {
+      name: "describe_table",
+      description: "Show schema of a table",
+      inputSchema: {
+        type: "object",
+        properties: { database: { type: "string" }, table: { type: "string" } },
+        required: ["table"],
       },
-      {
-        name: "describe_table",
-        description: "Show the schema for a specific table",
-        inputSchema: {
-          type: "object",
-          properties: {
-            database: {
-              type: "string",
-              description:
-                "Database name (optional, uses default if not specified)",
-            },
-            table: {
-              type: "string",
-              description: "Table name",
-            },
-          },
-          required: ["table"],
-        },
+    },
+    {
+      name: "execute_query",
+      description: "Run an arbitrary SQL query",
+      inputSchema: {
+        type: "object",
+        properties: { query: { type: "string" }, database: { type: "string" } },
+        required: ["query"],
       },
-      {
-        name: "execute_query",
-        description: "Execute a SQL query",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: `SQL query (only SELECT, ${
-                process.env.MARIADB_ALLOW_INSERT ? "INSERT," : ""
-              } ${process.env.MARIADB_ALLOW_UPDATE ? "UPDATE," : ""} ${
-                process.env.MARIADB_ALLOW_DELETE ? "DELETE," : ""
-              } SHOW, DESCRIBE, and EXPLAIN statements are allowed)`,
-            },
-            database: {
-              type: "string",
-              description:
-                "Database name (optional, uses default if not specified)",
-            },
-          },
-          required: ["query"],
-        },
-      },
-    ],
-  };
-});
+    },
+  ],
+}));
 
-/**
- * Handler for MariaDB database access tools
- */
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  try {
-    createConnectionPool();
-  } catch (error) {
-    console.error("[Fatal] Failed to initialize MariaDB connection:", error);
-    process.exit(1);
-  }
+// 2) CallTool handler
+mcpServer.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const tool = req.params.name;
+  const args = (req.params.arguments || {}) as Record<string, any>;
+  createConnectionPool(); // ensure pool exists
 
   try {
-    switch (request.params.name) {
+    switch (tool) {
       case "list_databases": {
-        console.error("[Tool] Executing list_databases");
         const { rows } = await executeQuery("SHOW DATABASES");
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
         };
       }
-
       case "list_tables": {
-        console.error("[Tool] Executing list_tables");
-
-        const database = request.params.arguments?.database as
-          | string
-          | undefined;
-
-        const { rows } = await executeQuery("SHOW FULL TABLES", [], database);
-
+        const db = args.database as string | undefined;
+        const { rows } = await executeQuery("SHOW FULL TABLES", [], db);
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
         };
       }
-
       case "describe_table": {
-        console.error("[Tool] Executing describe_table");
-
-        const database = request.params.arguments?.database as
-          | string
-          | undefined;
-        const table = request.params.arguments?.table as string;
-
-        if (!table) {
-          throw new McpError(ErrorCode.InvalidParams, "Table name is required");
-        }
-
-        const { rows } = await executeQuery(
-          `DESCRIBE \`${table}\``,
-          [],
-          database
-        );
-
+        const tbl = args.table as string;
+        if (!tbl)
+          throw new McpError(ErrorCode.InvalidParams, "`table` is required");
+        const db = args.database as string | undefined;
+        const { rows } = await executeQuery(`DESCRIBE \`${tbl}\``, [], db);
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
         };
       }
-
       case "execute_query": {
-        console.error("[Tool] Executing execute_query");
-
-        const query = request.params.arguments?.query as string;
-        const database = request.params.arguments?.database as
-          | string
-          | undefined;
-
-        if (!query) {
-          throw new McpError(ErrorCode.InvalidParams, "Query is required");
-        }
-
-        const { rows } = await executeQuery(query, [], database);
-
+        const qry = args.query as string;
+        if (!qry)
+          throw new McpError(ErrorCode.InvalidParams, "`query` is required");
+        const db = args.database as string | undefined;
+        const { rows } = await executeQuery(qry, [], db);
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(rows, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(rows, null, 2) }],
         };
       }
-
       default:
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `Unknown tool: ${request.params.name}`
-        );
+        throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${tool}`);
     }
-  } catch (error) {
-    console.error("[Error] Tool execution failed:", error);
-
-    // Format error message for client
+  } catch (err: any) {
+    console.error("[Tool Error]", err);
     return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        },
-      ],
       isError: true,
+      content: [{ type: "text", text: `Error: ${err.message || String(err)}` }],
     };
   }
 });
 
-/**
- * Start the server using stdio transport
- */
-async function main() {
-  console.error("[Setup] Starting MariaDB MCP server");
+// ─── Hono App & Routes ────────────────────────────────────────────────────────
+const app = new Hono();
+const transports = new Map<string, SSETransport>();
 
-  try {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("[Setup] MariaDB MCP server running on stdio");
-  } catch (error) {
-    console.error("[Fatal] Failed to start server:", error);
-    process.exit(1);
+// SSE endpoint (server → client)
+app.post("/sse", (c) =>
+  streamSSE(c, async (stream) => {
+    const transport = new SSETransport(stream);
+    transports.set(transport.sessionId, transport);
+
+    await mcpServer.connect(transport);
+    // Keepalive
+    while (true) {
+      await stream.sleep(30_000);
+      await transport.send({
+        jsonrpc: "2.0",
+        method: "keepalive",
+        params: { timestamp: Date.now() },
+      });
+    }
+  })
+);
+
+// Messages endpoint (client → server)
+app.post("/messages", async (c) => {
+  // 1) Raw parse
+  const raw = (await c.req.json()) as JSONRPCMessage;
+
+  // 2) Runtime guard: must have both `method` and `params`
+  if (
+    typeof raw !== "object" ||
+    raw === null ||
+    typeof (raw as any).method !== "string" ||
+    typeof (raw as any).params !== "object"
+  ) {
+    return c.text("Invalid JSON-RPC request", 400);
   }
-}
 
-// Handle process termination
-process.on("SIGINT", async () => {
-  console.error("[Shutdown] Closing MariaDB connection pool");
-  await endConnection();
-  process.exit(0);
+  // 3) Cast into our narrowed request type
+  const msg = raw as JSONRPCRequest & { params: { sessionId: string; [k: string]: any } };
+
+  const sessionId = msg.params.sessionId;
+  if (!sessionId) {
+    return c.text("Missing sessionId", 400);
+  }
+
+  const transport = transports.get(sessionId);
+  if (!transport) {
+    return c.text("Unknown sessionId", 404);
+  }
+
+  // 4) Now that TS knows msg.params exists, we can forward it:
+  transport.onmessage?.(msg);
+
+  return c.text("OK");
 });
 
-// Start the server
-main().catch((error) => {
-  console.error("[Fatal] Unhandled error:", error);
+// CORS & Health
+app.use("*", async (c, next) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("Access-Control-Allow-Headers", "*");
+  c.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  return next();
+});
+app.get("/health", (c) => c.json({ status: "ok" }));
+
+// ─── Startup Logic ───────────────────────────────────────────────────────────
+async function start() {
+  try {
+    const pool = createConnectionPool();
+    const conn = await pool.getConnection();
+    await conn.query("SELECT 1");
+    conn.release();
+    console.log("✅ Database connection OK");
+  } catch (err) {
+    console.error("❌ Database init failed:", err);
+    process.exit(1);
+  }
+
+  serve(app, (info) => {
+    console.log(
+      `🌐 Listening on http://${info.address ?? "localhost"}:${info.port}`
+    );
+    console.log(
+      `🔄 SSE endpoint: http://${info.address ?? "localhost"}:${info.port}/sse`
+    );
+  });
+}
+
+start().catch((err) => {
+  console.error("🔴 Startup error:", err);
   process.exit(1);
 });
