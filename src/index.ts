@@ -245,14 +245,23 @@ async function start() {
     process.exit(1);
   }
 
-  serve(app, (info) => {
-    console.log(
-      `🌐 Listening on http://${info.address ?? "localhost"}:${info.port}`
-    );
-    console.log(
-      `🔄 SSE endpoint: http://${info.address ?? "localhost"}:${info.port}/sse`
-    );
-  });
+  serve(
+    {
+      port: 3000,
+      hostname: "0.0.0.0",
+      fetch: app.fetch,
+    },
+    (info) => {
+      console.log(
+        `🌐 Listening on http://${info.address ?? "localhost"}:${info.port}`
+      );
+      console.log(
+        `🔄 SSE endpoint: http://${info.address ?? "localhost"}:${
+          info.port
+        }/sse`
+      );
+    }
+  );
 }
 
 start().catch((err) => {

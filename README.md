@@ -126,7 +126,8 @@ Shows the schema for a specific table.
   "params": {
     "sessionId": "session_id from /sse call",
     "name": "describe_table",
-    "database": "my_database_name"
+    "database": "my_database_name",
+    "table": "my_table_name"
   }
 }
 ```
