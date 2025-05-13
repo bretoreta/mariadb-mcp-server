@@ -247,8 +247,8 @@ async function start() {
 
   serve(
     {
-      port: 3000,
-      hostname: "0.0.0.0",
+      port: (process.env.APP_PORT as unknown as number) ?? 3000,
+      hostname: process.env.APP_HOSTNAME,
       fetch: app.fetch,
     },
     (info) => {
