@@ -8,6 +8,10 @@ It allows you to:
 - Describe table schemas
 - Execute SQL queries
 
+<a href="https://glama.ai/mcp/servers/@bretoreta/mariadb-mcp-server">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@bretoreta/mariadb-mcp-server/badge" alt="MariaDB Server MCP server" />
+</a>
+
 ## Security Features
 - **Read-only access Default**: SELECT, SHOW, DESCRIBE, and EXPLAIN
 - **Query validation**: Prevents SQL injection and blocks any data modification attempts
